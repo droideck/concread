@@ -34,6 +34,7 @@
 //! context we recommend you use only `maps` as a feature.
 
 #![deny(warnings)]
+#![cfg_attr(miri, allow(mismatched_lifetime_syntaxes))]
 #![warn(unused_extern_crates)]
 #![warn(missing_docs)]
 #![allow(clippy::needless_lifetimes)]

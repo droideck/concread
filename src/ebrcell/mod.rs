@@ -271,6 +271,7 @@ mod tests {
     use std::thread::scope;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_deref_mut() {
         let data: i64 = 0;
         let cc = EbrCell::new(data);
@@ -297,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_simple_create() {
         let data: i64 = 0;
         let cc = EbrCell::new(data);
