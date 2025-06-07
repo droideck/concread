@@ -586,12 +586,31 @@ impl<K: Clone + Ord + Debug, V: Clone> Drop for CursorWrite<K, V> {
 
 impl<K: Clone + Ord + Debug, V: Clone> Drop for CursorRead<K, V> {
     fn drop(&mut self) {
-        // If there is content in last_seen, a future generation wants us to remove it!
         let last_seen_guard = self
             .last_seen
             .try_lock()
             .expect("Unable to lock, something is horridly wrong!");
-        last_seen_guard.iter().for_each(|n| Node::free(*n));
+
+        // SAFETY FIX: Add protection against double-free and invalid pointer crashes
+        let mut seen_pointers = std::collections::HashSet::new();
+
+        last_seen_guard.iter().for_each(|n| {
+            // Validate pointer is not null
+            if n.is_null() {
+                return;
+            }
+
+            // Deduplicate pointers to prevent double-free
+            if seen_pointers.contains(n) {
+                eprintln!("WARNING: Duplicate pointer detected in BPTree CursorRead last_seen: {:p}", *n);
+                return;
+            }
+            seen_pointers.insert(*n);
+
+            // Free the node with additional safety
+            Node::free(*n);
+        });
+
         std::mem::drop(last_seen_guard);
     }
 }

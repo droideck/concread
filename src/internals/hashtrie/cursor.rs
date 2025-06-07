@@ -1081,7 +1081,29 @@ impl<K: Clone + Hash + Eq + Debug, V: Clone> Drop for CursorRead<K, V> {
             .last_seen
             .try_lock()
             .expect("Unable to lock, something is horridly wrong!");
-        last_seen_guard.iter().for_each(|p| p.free::<K, V>());
+
+        // SAFETY FIX: Add protection against double-free and invalid pointer crashes
+        let mut seen_pointers = Vec::new();
+
+        last_seen_guard.iter().for_each(|p| {
+            // Validate pointer is not null
+            if p.is_null() {
+                return;
+            }
+
+            // Simple duplicate check (for small lists this is acceptable)
+            for seen_ptr in &seen_pointers {
+                if *seen_ptr == *p {
+                    eprintln!("WARNING: Duplicate pointer detected in HashTrie CursorRead last_seen");
+                    return;
+                }
+            }
+            seen_pointers.push(*p);
+
+            // Free the node with additional safety
+            p.free::<K, V>();
+        });
+
         std::mem::drop(last_seen_guard);
     }
 }

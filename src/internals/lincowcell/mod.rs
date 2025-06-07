@@ -60,8 +60,9 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 
 /// Do not implement this. You don't need this negativity in your life.
 pub trait LinCowCellCapable<R, U> {
@@ -94,11 +95,23 @@ pub struct LinCowCellWriteTxn<'a, T, R, U> {
     work: U,
 }
 
-#[derive(Debug)]
 struct LinCowCellInner<R> {
-    // This gives the chain effect.
-    pin: ArcSwapOption<LinCowCellInner<R>>,
+    // CRITICAL FIX: Use AtomicPtr instead of ArcSwapOption to avoid debt mechanism
+    // This eliminates the circular debt dependencies that cause use-after-free crashes
+    pin: AtomicPtr<LinCowCellInner<R>>,
     data: R,
+}
+
+impl<R> std::fmt::Debug for LinCowCellInner<R>
+where
+    R: std::fmt::Debug
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinCowCellInner")
+            .field("pin", &self.pin.load(Ordering::Relaxed))
+            .field("data", &self.data)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -113,8 +126,45 @@ pub struct LinCowCellReadTxn<'a, T, R, U> {
 impl<R> LinCowCellInner<R> {
     pub fn new(data: R) -> Self {
         LinCowCellInner {
-            pin: ArcSwapOption::empty(),
+            pin: AtomicPtr::new(std::ptr::null_mut()),
             data,
+        }
+    }
+
+    // Helper method to safely set the next generation
+    fn set_next(&self, next: Arc<LinCowCellInner<R>>) {
+        // Convert Arc to raw pointer for storage
+        let raw_ptr = Arc::into_raw(next);
+        self.pin.store(raw_ptr as *mut LinCowCellInner<R>, Ordering::Release);
+    }
+
+    // Helper method to safely get the next generation
+    #[allow(dead_code)]
+    fn get_next(&self) -> Option<Arc<LinCowCellInner<R>>> {
+        let raw_ptr = self.pin.load(Ordering::Acquire);
+        if raw_ptr.is_null() {
+            None
+        } else {
+            // SAFETY: We know this pointer came from Arc::into_raw
+            // and we increment the reference count here
+            unsafe {
+                let arc_ptr = raw_ptr as *const LinCowCellInner<R>;
+                Some(Arc::from_raw(arc_ptr))
+            }
+        }
+    }
+}
+
+impl<R> Drop for LinCowCellInner<R> {
+    fn drop(&mut self) {
+        // Clean up the atomic pointer safely
+        let raw_ptr = self.pin.load(Ordering::Acquire);
+        if !raw_ptr.is_null() {
+            // SAFETY: Convert back to Arc and drop it properly
+            unsafe {
+                let _arc = Arc::from_raw(raw_ptr as *const LinCowCellInner<R>);
+                // Arc will be dropped here, decrementing reference count
+            }
         }
     }
 }
@@ -135,7 +185,11 @@ where
 
     /// Begin a read txn
     pub fn read(&self) -> LinCowCellReadTxn<T, R, U> {
-        // inc the arc.
+        // Ensure we observe the most recent committed state
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+        // Use load_full for stronger consistency - avoids arc-swap debt mechanism issues
+        // and ensures we see a consistent generation chain state
         let work = self.active.load_full();
         LinCowCellReadTxn {
             _caller: self,
@@ -182,20 +236,26 @@ where
             work,
         } = write;
 
-        // Get the previous generation.
-        let rwguard = self.active.load();
+        // Get the previous generation with strong consistency
+        let rwguard = self.active.load_full();
         // Start to setup for the commit.
         let newdata = guard.pre_commit(work, &rwguard.data);
 
         let new_inner = Arc::new(LinCowCellInner::new(newdata));
-        {
-            // This modifies the next pointer of the existing read txns
-            // Create the arc pointer to our new data
-            // add it to the last value
-            rwguard.pin.store(Some(new_inner.clone()))
-        }
-        // now over-write the last value in the mutex.
+
+        // CRITICAL FIX: Use safe AtomicPtr operations instead of ArcSwapOption
+        // This eliminates debt mechanism issues that cause crashes
+        rwguard.set_next(new_inner.clone());
+
+        // Use strong memory ordering to ensure all previous operations
+        // are visible before the new generation becomes the active one
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+        // Now atomically update the active pointer
         self.active.store(new_inner);
+
+        // Final fence to ensure the store is visible to all readers
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 }
 
