@@ -58,6 +58,7 @@
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 
@@ -92,10 +93,20 @@ pub struct LinCowCellWriteTxn<'a, T, R, U> {
     work: U,
 }
 
+const LINCOW_CANARY: u64 = 0xC0C0_BEAD_CAFE_F00D;
+
 #[derive(Debug)]
 struct LinCowCellInner<R> {
+    canary_pre: u64,
     // This gives the chain effect.
     pin: Mutex<Option<Arc<LinCowCellInner<R>>>>,
+    /// Stores the expected raw pointer value of the Arc inside `pin`.
+    /// Set atomically during commit, checked during drop. If the value
+    /// read during drop differs, the pin was corrupted between commit
+    /// and drop — narrowing the corruption window.
+    /// 0 means pin is None (no successor set yet).
+    expected_pin_ptr: AtomicUsize,
+    canary_post: u64,
     data: R,
 }
 
@@ -111,39 +122,77 @@ pub struct LinCowCellReadTxn<'a, T, R, U> {
 impl<R> LinCowCellInner<R> {
     pub fn new(data: R) -> Self {
         LinCowCellInner {
+            canary_pre: LINCOW_CANARY,
             pin: Mutex::new(None),
+            expected_pin_ptr: AtomicUsize::new(0),
+            canary_post: LINCOW_CANARY,
             data,
         }
+    }
+
+    /// Validate this node's integrity and take the pin in one pass.
+    /// Returns the taken pin (if any). Panics with diagnostics on corruption.
+    fn validate_and_take_pin(&mut self, context: &str) -> Option<Arc<LinCowCellInner<R>>> {
+        let self_ptr = self as *const _ as usize;
+
+        // 1. Canary — detects broad heap corruption (struct overwritten).
+        if self.canary_pre != LINCOW_CANARY || self.canary_post != LINCOW_CANARY {
+            panic!(
+                "LinCowCellInner CORRUPTION [{context}]: self=0x{self_ptr:x}, \
+                 canary_pre=0x{:x}, canary_post=0x{:x} (expect 0x{LINCOW_CANARY:x})",
+                self.canary_pre, self.canary_post,
+            );
+        }
+
+        let pin = self
+            .pin
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // 2. Expected pin pointer — detects targeted corruption of the Arc
+        //    inside the Mutex (the exact pattern from crash 3).
+        let expected = self.expected_pin_ptr.load(Ordering::Relaxed);
+        let actual = pin.as_ref().map(|a| Arc::as_ptr(a) as usize).unwrap_or(0);
+        if actual != expected {
+            panic!(
+                "LinCowCellInner CORRUPTION [{context}]: self=0x{self_ptr:x}, \
+                 pin expected=0x{expected:x}, actual=0x{actual:x}",
+            );
+        }
+
+        // Valid — take the pin and clear the expectation.
+        let taken = pin.take();
+        self.expected_pin_ptr.store(0, Ordering::Relaxed);
+        taken
     }
 }
 
 impl<R> Drop for LinCowCellInner<R> {
     fn drop(&mut self) {
-        // Ensure the default drop won't recursively drop the chain
-        // Use Arc::into_inner so we only advance on unique ownership
-        let mut current = self
-            .pin
-            .get_mut()
-            .map(|pin| pin.take())
-            .unwrap_or_else(|e| e.into_inner().take());
+        let mut current = self.validate_and_take_pin("drop");
 
-        // Drop the chain iteratively to avoid stack overflow
+        // Drop the chain iteratively to avoid stack overflow.
+        // Use Arc::into_inner so we only advance on unique ownership.
+        let mut depth: u64 = 0;
         while let Some(arc) = current {
-            // Try to get exclusive ownership of the next link
+            let raw = Arc::as_ptr(&arc) as usize;
+
+            // Sanity-check the refcount before into_inner touches it.
+            let strong = Arc::strong_count(&arc);
+            if strong == 0 || strong > 0x0000_FFFF_FFFF {
+                panic!(
+                    "LinCowCellInner::drop: depth={depth} ptr=0x{raw:x} \
+                     suspicious strong_count={strong}",
+                );
+            }
+
             match Arc::into_inner(arc) {
                 Some(mut inner) => {
-                    // Continue with the next link.
-                    current = inner
-                        .pin
-                        .get_mut()
-                        .map(|pin| pin.take())
-                        .unwrap_or_else(|e| e.into_inner().take());
+                    current = inner.validate_and_take_pin("chain walk");
                 }
-                None => {
-                    // Another strong reference exists; stop without breaking its chain
-                    break;
-                }
+                None => break,
             }
+            depth += 1;
         }
     }
 }
@@ -216,15 +265,32 @@ where
         // Start to setup for the commit.
         let newdata = guard.pre_commit(work, &rwguard.data);
 
-        // Start to setup for the commit.
         let new_inner = Arc::new(LinCowCellInner::new(newdata));
+        let expected_ptr = Arc::as_ptr(&new_inner) as usize;
         {
             // This modifies the next pointer of the existing read txns
             let mut rwguard_inner = rwguard.pin.lock().unwrap();
             // Create the arc pointer to our new data
             // add it to the last value
             *rwguard_inner = Some(new_inner.clone());
+            // Verify pin was written correctly — if heap corruption occurred
+            // during the write, the pointer stored differs from what we wrote.
+            let stored_ptr = rwguard_inner
+                .as_ref()
+                .map(|a| Arc::as_ptr(a) as usize)
+                .unwrap_or(0);
+            if stored_ptr != expected_ptr {
+                panic!(
+                    "LinCowCell::commit: pin write-back MISMATCH! \
+                     wrote Arc ptr=0x{:x} but read back 0x{:x}. \
+                     Heap corruption during pin write.",
+                    expected_ptr, stored_ptr,
+                );
+            }
         }
+        // Store the expected pin pointer so drop can validate it later.
+        // If something corrupts the pin between now and drop, we'll know.
+        rwguard.expected_pin_ptr.store(expected_ptr, Ordering::Relaxed);
         // now over-write the last value in the mutex.
         *rwguard = new_inner;
     }

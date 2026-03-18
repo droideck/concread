@@ -91,6 +91,11 @@ where
         self.inner.is_null()
     }
 
+    /// Return the raw pointer as a usize for diagnostics.
+    pub(crate) fn as_raw_ptr(&self) -> usize {
+        self.inner as usize
+    }
+
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn make_mut(&self) -> &mut K {
         &mut *(*self.inner).k.as_mut_ptr()
@@ -135,6 +140,11 @@ where
 
     pub fn is_null(&self) -> bool {
         self.inner.is_null()
+    }
+
+    /// Return the raw pointer as a usize for diagnostics.
+    pub(crate) fn as_raw_ptr(&self) -> usize {
+        self.inner as usize
     }
 }
 
@@ -311,9 +321,9 @@ where
         assert!(!n.is_null());
         assert!(self.size > 0);
         unsafe {
-            // We should have a prev and next
-            debug_assert!(!(*n.inner).prev.is_null());
-            debug_assert!(!(*n.inner).next.is_null());
+            // Null prev/next means already extracted (we null them below).
+            assert!(!(*n.inner).prev.is_null(), "LL::extract: double-extract");
+            assert!(!(*n.inner).next.is_null(), "LL::extract: double-extract");
             // And that prev's next is us, and next's prev is us.
             // This is asserting that we have a proper construction
             //
@@ -339,11 +349,9 @@ where
             // Now is
             // prev <-> next
 
-            // Null things for paranoia.
-            if cfg!(test) || cfg!(debug_assertions) {
-                (*n.inner).prev = ptr::null_mut();
-                (*n.inner).next = ptr::null_mut();
-            }
+            // Always null — makes double-extract immediately detectable.
+            (*n.inner).prev = ptr::null_mut();
+            (*n.inner).next = ptr::null_mut();
             // Finally, we have
             //
             // null <- n -> null

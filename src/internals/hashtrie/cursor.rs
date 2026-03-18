@@ -481,11 +481,24 @@ impl<K: Hash + Eq + Clone + Debug, V: Clone> LinCowCellCapable<CursorRead<K, V>,
         prev: &CursorRead<K, V>,
     ) -> CursorRead<K, V> {
         let mut prev_last_seen = prev.last_seen.lock().unwrap();
-        debug_assert!((*prev_last_seen).is_empty());
+        assert!(
+            (*prev_last_seen).is_empty(),
+            "pre_commit: prev CursorRead last_seen is NOT empty (len={}). \
+             This means a previous commit's freed nodes were not drained, \
+             or two commits used the same active CursorRead. txid={}",
+            (*prev_last_seen).len(),
+            new.txid,
+        );
 
         let new_last_seen = &mut new.last_seen;
         std::mem::swap(&mut (*prev_last_seen), &mut (*new_last_seen));
-        debug_assert!((*new_last_seen).is_empty());
+        assert!(
+            (*new_last_seen).is_empty(),
+            "pre_commit: after swap, writer last_seen is NOT empty (len={}). \
+             The prev CursorRead had stale entries. txid={}",
+            (*new_last_seen).len(),
+            new.txid,
+        );
 
         // Mark anything in the tree that is dirty as clean.
         new.mark_clean();

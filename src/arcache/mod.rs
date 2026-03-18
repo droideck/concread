@@ -111,6 +111,24 @@ where
     Haunted(LLNodeRef<CacheItemInner<K>>),
 }
 
+impl<K, V> CacheItem<K, V>
+where
+    K: Hash + Eq + Ord + Clone + Debug + Sync + Send + 'static,
+    V: Clone + Debug + Sync + Send + 'static,
+{
+    /// Return the variant name and stored raw pointer for diagnostics.
+    /// Zero-cost: only called on error paths.
+    fn diagnostic(&self) -> (&'static str, usize) {
+        match self {
+            CacheItem::Freq(llp, _) => ("Freq", llp.as_raw_ptr()),
+            CacheItem::Rec(llp, _) => ("Rec", llp.as_raw_ptr()),
+            CacheItem::GhostFreq(llp) => ("GhostFreq", llp.as_raw_ptr()),
+            CacheItem::GhostRec(llp) => ("GhostRec", llp.as_raw_ptr()),
+            CacheItem::Haunted(llp) => ("Haunted", llp.as_raw_ptr()),
+        }
+    }
+}
+
 unsafe impl<
         K: Hash + Eq + Ord + Clone + Debug + Sync + Send + 'static,
         V: Clone + Debug + Sync + Send + 'static,
@@ -737,6 +755,7 @@ impl<
         tracing::trace!("r {} >>> {}", p_was, *p);
     }
 
+
     fn drain_tlocal_inc<S>(
         &self,
         cache: &mut DataMapWriteTxn<K, CacheItem<K, V>>,
@@ -771,7 +790,7 @@ impl<
                     // stats.write_includes += 1;
                     stats.include(&k);
                     // The key MUST NOT exist in the cache already.
-                    let existing = cache.insert(k, CacheItem::Rec(llp, tci));
+                    let existing = cache.insert(k, CacheItem::Rec(llp.clone(), tci));
                     assert!(
                         existing.is_none(),
                         "Impossible state! Key must not already exist in cache!"
@@ -786,7 +805,7 @@ impl<
                         size: HAUNTED_SIZE,
                     });
                     // The key MUST NOT exist in the cache already.
-                    let existing = cache.insert(k, CacheItem::Haunted(llp));
+                    let existing = cache.insert(k, CacheItem::Haunted(llp.clone()));
                     assert!(
                         existing.is_none(),
                         "Impossible state! Key must not already exist in cache!"
@@ -1133,7 +1152,7 @@ impl<
                         });
                         stats.include(&k);
                         // The key MUST NOT exist in the cache already.
-                        let existing = cache.insert(k, CacheItem::Rec(llp, iv));
+                        let existing = cache.insert(k, CacheItem::Rec(llp.clone(), iv));
                         assert!(
                             existing.is_none(),
                             "Impossible state! Key must not already exist in cache!"
@@ -1262,13 +1281,49 @@ impl<
 
                 match r {
                     Some(ref mut ci) => {
+                        if !matches!(ci, CacheItem::GhostFreq(_) | CacheItem::GhostRec(_)) {
+                            let (ci_variant, ci_ptr) = ci.diagnostic();
+                            panic!(
+                                "evict_to_haunted_len: WRONG VARIANT for key {:?}. \
+                                 Popped node ptr=0x{:x} from ghost list, but cache map \
+                                 entry is variant={}, ptr=0x{:x}. \
+                                 ll.len()={}, to_ll.len()={}, target_size={}",
+                                pointer.as_ref().k,
+                                pointer.as_raw_ptr(),
+                                ci_variant,
+                                ci_ptr,
+                                ll.len(),
+                                to_ll.len(),
+                                size,
+                            );
+                        }
                         // Now change the state.
                         let mut next_state = CacheItem::Haunted(pointer);
                         mem::swap(*ci, &mut next_state);
                     }
                     None => {
-                        // Impossible state!
-                        unreachable!();
+                        let key = &pointer.as_ref().k;
+                        let dupes_in_ll = ll.iter_mut()
+                            .filter(|n| &n.k == key)
+                            .count();
+                        let in_to_ll = to_ll.iter_mut()
+                            .any(|n| &n.k == key);
+
+                        panic!(
+                            "evict_to_haunted_len: KEY MISSING from cache map for key {:?}. \
+                             Popped node ptr=0x{:x} from ghost list, but cache map \
+                             has no entry for this key. \
+                             ll.len()={}, to_ll.len()={}, target_size={}, \
+                             dupes_remaining_in_src_ll={}, \
+                             key_found_in_dest_ll={}",
+                            key,
+                            pointer.as_raw_ptr(),
+                            ll.len(),
+                            to_ll.len(),
+                            size,
+                            dupes_in_ll,
+                            in_to_ll,
+                        );
                     }
                 };
             } else {
@@ -1312,38 +1367,112 @@ impl<
                     Some(ref mut ci) => {
                         let mut next_state = match &ci {
                             CacheItem::Freq(llp, _v) => {
-                                // The pointer from any key MUST be unique!
-                                assert!(llp == &owned, "Impossible State! Pointer in map does not match the pointer from the list!");
-                                // No need to extract, already popped!
-                                // $ll.extract(*llp);
+                                if llp != &owned {
+                                    let (ci_variant, ci_ptr) = ci.diagnostic();
+                                    panic!(
+                                        "evict_to_len: POINTER MISMATCH for key {:?}. \
+                                         Popped node ptr=0x{:x}, node_txid={}, \
+                                         but cache map entry is variant={}, ptr=0x{:x}. \
+                                         commit_txid={}, ll.len()={}, to_ll.len()={}, \
+                                         target_size={}",
+                                        owned.as_ref().k,
+                                        owned.as_raw_ptr(),
+                                        owned.as_ref().txid,
+                                        ci_variant,
+                                        ci_ptr,
+                                        txid,
+                                        ll.len(),
+                                        to_ll.len(),
+                                        size,
+                                    );
+                                }
                                 stats.evict_from_frequent(&owned.as_ref().k);
                                 let pointer = to_ll.append_n(owned);
                                 CacheItem::GhostFreq(pointer)
                             }
                             CacheItem::Rec(llp, _v) => {
-                                // The pointer from any key MUST be unique!
-                                assert!(llp == &owned, "Impossible State! Pointer in map does not match the pointer from the list!");
-                                // No need to extract, already popped!
-                                // $ll.extract(*llp);
+                                if llp != &owned {
+                                    let (ci_variant, ci_ptr) = ci.diagnostic();
+                                    panic!(
+                                        "evict_to_len: POINTER MISMATCH for key {:?}. \
+                                         Popped node ptr=0x{:x}, node_txid={}, \
+                                         but cache map entry is variant={}, ptr=0x{:x}. \
+                                         commit_txid={}, ll.len()={}, to_ll.len()={}, \
+                                         target_size={}",
+                                        owned.as_ref().k,
+                                        owned.as_raw_ptr(),
+                                        owned.as_ref().txid,
+                                        ci_variant,
+                                        ci_ptr,
+                                        txid,
+                                        ll.len(),
+                                        to_ll.len(),
+                                        size,
+                                    );
+                                }
                                 stats.evict_from_recent(&owned.as_mut().k);
                                 let pointer = to_ll.append_n(owned);
                                 CacheItem::GhostRec(pointer)
                             }
                             _ => {
-                                // Impossible state! All members of the from-ll, must be
-                                // in either the frequent or recent state.
-                                unreachable!();
+                                let (ci_variant, ci_ptr) = ci.diagnostic();
+                                panic!(
+                                    "evict_to_len: WRONG VARIANT for key {:?}. \
+                                     Popped node ptr=0x{:x}, node_txid={}, \
+                                     from freq/rec list, but cache map entry is \
+                                     variant={}, ptr=0x{:x}. commit_txid={}, \
+                                     ll.len()={}, to_ll.len()={}, target_size={}",
+                                    owned.as_ref().k,
+                                    owned.as_raw_ptr(),
+                                    owned.as_ref().txid,
+                                    ci_variant,
+                                    ci_ptr,
+                                    txid,
+                                    ll.len(),
+                                    to_ll.len(),
+                                    size,
+                                );
                             }
                         };
                         // Now change the state.
                         mem::swap(*ci, &mut next_state);
                     }
                     None => {
-                        // Impossible state! This indicates that the key was already
-                        // removed. Only one key -> linked-list-pointer should exist at
-                        // anytime. If we already removed this, that indicates there were
-                        // two llp's with the same key!
-                        unreachable!();
+                        // Scan the lists to understand how the key went
+                        // missing from the cache map.
+                        let key = &owned.as_ref().k;
+
+                        // Check if another node with the same key still
+                        // remains in the source list (duplicate-node bug).
+                        let dupes_in_ll = ll.iter_mut()
+                            .filter(|n| &n.k == key)
+                            .count();
+
+                        // Check if the key was already moved to the ghost
+                        // (destination) list by an earlier iteration of
+                        // this same loop.
+                        let in_to_ll = to_ll.iter_mut()
+                            .any(|n| &n.k == key);
+
+                        panic!(
+                            "evict_to_len: KEY MISSING from cache map for key {:?}. \
+                             Popped node ptr=0x{:x}, node_txid={}, node_size={} \
+                             from freq/rec list, but cache map has no entry for \
+                             this key. commit_txid={}, \
+                             ll.len()={}, to_ll.len()={}, target_size={}, \
+                             dupes_remaining_in_src_ll={}, \
+                             key_found_in_dest_ghost_ll={}",
+                            key,
+                            owned.as_raw_ptr(),
+                            owned.as_ref().txid,
+                            owned.as_ref().size,
+                            txid,
+                            ll.len(),
+                            to_ll.len(),
+                            size,
+                            dupes_in_ll,
+                            in_to_ll,
+                        );
                     }
                 };
             } else {
@@ -1522,31 +1651,70 @@ impl<
                 Some(ref mut ci) => {
                     let mut next_state = match &ci {
                         CacheItem::Freq(n, _) => {
-                            debug_assert!(n == &owned);
+                            if n != &owned {
+                                let (ci_variant, ci_ptr) = ci.diagnostic();
+                                panic!(
+                                    "drain_ll_to_ghost: POINTER MISMATCH for key {:?}. \
+                                     Popped node ptr=0x{:x}, but cache map entry is \
+                                     variant={}, ptr=0x{:x}.",
+                                    owned.as_ref().k,
+                                    owned.as_raw_ptr(),
+                                    ci_variant,
+                                    ci_ptr,
+                                );
+                            }
                             stats.evict_from_frequent(&owned.as_ref().k);
                             let pointer = gf.append_n(owned);
                             CacheItem::GhostFreq(pointer)
                         }
                         CacheItem::Rec(n, _) => {
-                            debug_assert!(n == &owned);
+                            if n != &owned {
+                                let (ci_variant, ci_ptr) = ci.diagnostic();
+                                panic!(
+                                    "drain_ll_to_ghost: POINTER MISMATCH for key {:?}. \
+                                     Popped node ptr=0x{:x}, but cache map entry is \
+                                     variant={}, ptr=0x{:x}.",
+                                    owned.as_ref().k,
+                                    owned.as_raw_ptr(),
+                                    ci_variant,
+                                    ci_ptr,
+                                );
+                            }
                             stats.evict_from_recent(&owned.as_ref().k);
                             let pointer = gr.append_n(owned);
                             CacheItem::GhostRec(pointer)
                         }
                         _ => {
-                            // Impossible state!
-                            unreachable!();
+                            let (ci_variant, ci_ptr) = ci.diagnostic();
+                            panic!(
+                                "drain_ll_to_ghost: WRONG VARIANT for key {:?}. \
+                                 Popped node ptr=0x{:x} from freq/rec list, but cache map \
+                                 entry is variant={}, ptr=0x{:x}.",
+                                owned.as_ref().k,
+                                owned.as_raw_ptr(),
+                                ci_variant,
+                                ci_ptr,
+                            );
                         }
                     };
                     // Now change the state.
                     mem::swap(*ci, &mut next_state);
                 }
                 None => {
-                    // Impossible state! This indicates that the key was already
-                    // removed. Only one key -> linked-list-pointer should exist at
-                    // anytime. If we already removed this, that indicates there were
-                    // two llp's with the same key!
-                    unreachable!();
+                    let key = &owned.as_ref().k;
+                    let dupes_in_ll = ll.iter_mut()
+                        .filter(|n| &n.k == key)
+                        .count();
+
+                    panic!(
+                        "drain_ll_to_ghost: KEY MISSING from cache map for key {:?}. \
+                         Popped node ptr=0x{:x} from freq/rec list, but cache map \
+                         has no entry for this key. \
+                         dupes_remaining_in_src_ll={}",
+                        key,
+                        owned.as_raw_ptr(),
+                        dupes_in_ll,
+                    );
                 }
             }
 
@@ -1575,8 +1743,27 @@ impl<
                 let before_len = ll.len();
                 debug_assert!(ll.len() > 0);
 
-                // Need to free from the cache.
-                cache.remove(&node.k);
+                // Remove from the cache map and verify the removed entry
+                // was Haunted. If it was revived to a live state, removing
+                // it orphans the live node in rec/freq.
+                if let Some(ci) = cache.remove(&node.k) {
+                    if !matches!(ci, CacheItem::Haunted(_)) {
+                        let (ci_variant, ci_ptr) = ci.diagnostic();
+                        panic!(
+                            "drain_ll_min_txid: REMOVED non-Haunted entry for key {:?}! \
+                             (haunted node txid={}, min_txid={}) but cache map \
+                             entry was variant={}, ptr=0x{:x} — NOT Haunted! \
+                             The live node in rec/freq is now orphaned. \
+                             haunted.len()={}",
+                            node.k,
+                            node.txid,
+                            min_txid,
+                            ci_variant,
+                            ci_ptr,
+                            ll.len(),
+                        );
+                    }
+                }
 
                 // Okay, this node can be trimmed.
                 ll.drop_head();
