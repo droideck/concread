@@ -1746,9 +1746,12 @@ impl<
                 // Remove from the cache map and verify the removed entry
                 // was Haunted. If it was revived to a live state, removing
                 // it orphans the live node in rec/freq.
+                let head_ptr = ll.peek_head_ref().map(|r| r.as_raw_ptr()).unwrap_or(0);
+
                 if let Some(ci) = cache.remove(&node.k) {
+                    let (ci_variant, ci_ptr) = ci.diagnostic();
+
                     if !matches!(ci, CacheItem::Haunted(_)) {
-                        let (ci_variant, ci_ptr) = ci.diagnostic();
                         panic!(
                             "drain_ll_min_txid: REMOVED non-Haunted entry for key {:?}! \
                              (haunted node txid={}, min_txid={}) but cache map \
@@ -1760,6 +1763,28 @@ impl<
                             min_txid,
                             ci_variant,
                             ci_ptr,
+                            ll.len(),
+                        );
+                    }
+
+                    // The cache map's Haunted pointer must match the
+                    // haunted list head we are about to drop. If they
+                    // differ, a second node for this key exists in
+                    // another list — removing the cache entry just
+                    // orphaned it.
+                    if ci_ptr != head_ptr {
+                        panic!(
+                            "drain_ll_min_txid: POINTER MISMATCH for key {:?}! \
+                             Cache map Haunted ptr=0x{:x} but haunted list \
+                             head ptr=0x{:x}. A second node for this key \
+                             exists in another list and is now orphaned. \
+                             haunted node txid={}, min_txid={}, \
+                             haunted.len()={}",
+                            node.k,
+                            ci_ptr,
+                            head_ptr,
+                            node.txid,
+                            min_txid,
                             ll.len(),
                         );
                     }

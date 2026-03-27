@@ -388,6 +388,17 @@ where
         }
     }
 
+    /// Return a non-owning reference to the head node, for pointer comparison.
+    pub(crate) fn peek_head_ref(&self) -> Option<LLNodeRef<K>> {
+        debug_assert!(!self.head.is_null());
+        let next = unsafe { (*self.head).next };
+        if next == self.tail {
+            None
+        } else {
+            Some(LLNodeRef { inner: next })
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn peek_tail(&self) -> Option<&K> {
         debug_assert!(!self.tail.is_null());
